@@ -1,583 +1,492 @@
-# app.py
-# AURC 계산기 — One-Page PDF Style + Cohorts (FULL v4)
-# - 한 페이지 PDF 레이아웃
-# - 월/주 단위 토글, 동적 Horizon
-# - 구간 컨벤션(G01~G04) 개선율: 기본값 G02=70%, G03=60%, G04=50% (G01=0%)
-# - 생존/ΔS/Hazard 시각화 (한글 축)
-# - 코호트: fst_months 전용(1/3/6/12 ON/OFF)
-# - AURC 표, Data QA, 벤치마크 비교, 의사결정 카드(Go/검토/보류)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib
 import matplotlib.pyplot as plt
-import seaborn as sns
-from statsmodels.stats.proportion import proportion_confint
-from typing import Tuple, List, Optional
+import matplotlib
+from matplotlib import font_manager as _fm
+import calendar as _cal
+import re
 
-st.set_page_config(page_title="AURC 계산기 — PDF Style + Cohorts v4", page_icon="📈", layout="wide")
-sns.set_theme(style="whitegrid")
+# ==============================
+# Page & Fonts
+# ==============================
+st.set_page_config(page_title="수업 잔존기간 분석 (월/주 격자 + 호환모드)", layout="centered")
 
-# -------------------- 폰트 --------------------
-def setup_korean_font():
-    candidates = [
-        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",  # macOS
-        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",     # Linux
-        "C:/Windows/Fonts/malgun.ttf",                         # Windows
-        "NanumGothic", "Apple SD Gothic Neo", "Malgun Gothic"
-    ]
-    for path in candidates:
-        try:
-            if "/" in path:
-                import matplotlib.font_manager as fm
-                fm.fontManager.addfont(path)
-                matplotlib.rcParams["font.family"] = fm.FontProperties(fname=path).get_name()
-            else:
-                matplotlib.rcParams["font.family"] = path
-            break
-        except Exception:
-            continue
-    matplotlib.rcParams["axes.unicode_minus"] = False
-setup_korean_font()
+_kor_candidates = ["AppleGothic","Malgun Gothic","NanumGothic","NanumBarunGothic","Noto Sans CJK KR","Noto Sans KR","Pretendard"]
+_avail = set(f.name for f in _fm.fontManager.ttflist)
+for _nm in _kor_candidates:
+    if _nm in _avail:
+        matplotlib.rcParams["font.family"] = _nm
+        break
+matplotlib.rcParams["axes.unicode_minus"] = False
 
-# -------------------- 스타일 --------------------
-STYLE = """
+st.markdown(r"""
 <style>
-.section-card {border:1px solid #e6e9ef; padding:1rem 1.2rem; border-radius:12px; background: #ffffff;}
-.section-title {font-weight:700; margin-bottom:0.2rem;}
-.section-caption {color:#6b7280; font-size:0.9rem; margin-top:0.1rem;}
-hr.soft {border:none; border-top:1px solid #efeff5; margin:0.6rem 0 0.8rem 0;}
-.kpi {border:1px solid #e6e9ef; padding:0.8rem 1rem; border-radius:12px; background:#fafafa;}
-.kpi h3 {margin:0; font-size:0.9rem; color:#6b7280; font-weight:600;}
-.kpi .val {font-size:1.4rem; font-weight:800; margin-top:0.3rem;}
-.small-note {color:#6b7280; font-size:0.85rem;}
-
-/* Decision Card */
-.decision {border-radius:14px; padding:1rem 1.2rem; color:#0b0f19;}
-.go {background:#ecfdf5; border:1px solid #a7f3d0;}
-.review {background:#fffbeb; border:1px solid #fde68a;}
-.hold {background:#fef2f2; border:1px solid #fecaca;}
-.decision h3 {margin:0 0 .4rem 0; font-size:1.05rem;}
-.decision .badge {display:inline-block; padding:.2rem .5rem; border-radius:9999px; font-weight:700; font-size:.85rem;}
-.badge-go {background:#10b981; color:white;}
-.badge-review {background:#f59e0b; color:white;}
-.badge-hold {background:#ef4444; color:white;}
-ul.tight {margin:.2rem 0 0 .9rem; padding:0;}
-ul.tight li {margin:.12rem 0;}
+.topbar{position:sticky; top:0; z-index:5; background:#fff; padding:12px 6px; border-bottom:1px solid #eee;}
+.title{font-size:1.25rem; font-weight:800;}
+.subtitle{font-size:.95rem; color:#6b7280;}
+.card{border:1px solid #e5e7eb; border-radius:14px; padding:10px 12px; background:#fff;}
+.label{color:#6b7280; font-size:.85rem;}
+.value{font-size:1.05rem; font-weight:700;}
+hr{margin: 10px 0;}
 </style>
-"""
-st.markdown(STYLE, unsafe_allow_html=True)
+<div class="topbar">
+  <div class="title">수업 잔존기간 통합 분석 도구</div>
+  <div class="subtitle">업로드 → <b>날짜 필터</b> → 생존분석(KM) → 코호트/이탈률 → 구간 개선 → 개선 효과</div>
+</div>
+""", unsafe_allow_html=True)
 
-# -------------------- CSV 로더 --------------------
-TRY_ENCODINGS = ["utf-8-sig", "utf-8", "cp949", "euc-kr"]
-def read_csv_kr(file_like, **kwargs):
-    last_err = None
-    for enc in TRY_ENCODINGS:
-        try:
-            return pd.read_csv(file_like, encoding=enc, **kwargs)
-        except Exception as e:
-            last_err = e
-    raise last_err
+# ==============================
+# Utils
+# ==============================
+STOP = {"finish","auto_finish","done","nocard","nopay"}
 
-# -------------------- 스키마 --------------------
-def autodetect_format(df: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
-    cols = {c.lower() for c in df.columns}
-    if {"month", "survival"}.issubset(cols):
-        out = df.rename(columns=str.lower)[["month", "survival"]].copy()
-        out["month"] = out["month"].astype(int)
-        return "agg_survival_month", out.sort_values("month")
-    if {"month", "hazard"}.issubset(cols):
-        out = df.rename(columns=str.lower)[["month", "hazard"]].copy()
-        out["month"] = out["month"].astype(int)
-        return "agg_hazard_month", out.sort_values("month")
-    if {"month", "churn"}.issubset(cols):
-        out = df.rename(columns=str.lower)[["month", "churn"]].copy()
-        out["month"] = out["month"].astype(int)
-        return "agg_churn_month", out.sort_values("month")
-    low = {c.lower(): c for c in df.columns}
-    if "done_month" in low:
-        return "raw_done_month", df.rename(columns=str.lower).copy()
-    if "done_week" in low:
-        return "raw_done_week", df.rename(columns=str.lower).copy()
-    raise ValueError("형식 인식 실패: (month+survival/hazard/churn) 또는 raw의 done_month/done_week 필요")
+def to_num(x):
+    return pd.to_numeric(x, errors="coerce")
 
-# -------------------- 계산 --------------------
-def hazards_to_survival(h: np.ndarray) -> np.ndarray:
-    S, surv = [], 1.0
-    for hm in h:
-        surv *= max(0.0, 1.0 - float(hm))
-        S.append(surv)
-    return np.array(S, dtype=float)
+def km_bins_timegrid(durations_month, events, H, unit="month"):
+    """
+    KM survival sampled at integer bins 1..H for the chosen unit.
+    - durations_month: durations in "done_month" units (1 month = 4 weeks by data definition)
+    - unit: "month" or "week"
+    """
+    if unit not in {"month","week"}:
+        raise ValueError("unit must be 'month' or 'week'")
+    d_m = np.asarray(durations_month, float)
+    if unit == "month":
+        d = d_m
+    else:  # week grid: 1 month == 4 weeks (data says: done_month is 4-week based)
+        d = d_m * 4.0
 
-def survival_to_hazards(S: np.ndarray) -> np.ndarray:
-    h, prev = [], 1.0
-    for s in S:
-        s = float(s)
-        h.append(0.0 if prev <= 0 else max(0.0, 1.0 - s/prev))
-        prev = s
-    return np.array(h, dtype=float)
+    e = np.asarray(events, bool)
+    H = int(H)
 
-def aurc_from_survival(S: np.ndarray, horizon: Optional[int] = None) -> float:
-    if horizon is not None:
-        S = S[:horizon]
-    return float(np.sum(S))
+    uniq_evt = np.unique(d[e])
+    S = 1.0
+    step = {}
+    for t in uniq_evt:
+        n = np.sum(d >= t)        # at risk just before t
+        di = np.sum((d == t) & e) # events at t
+        step[t] = 1.0 if n <= 0 else max(0.0, min(1.0, 1.0 - di / n))
 
-def build_survival_from_done(x: pd.Series, max_time: int, treat_nan_as_censored: bool=True) -> np.ndarray:
-    arr = x.to_numpy()
-    N = len(arr)
-    S = []
-    for t in range(1, max_time+1):
-        if treat_nan_as_censored:
-            survived = np.sum((arr >= t) | pd.isna(arr))
-        else:
-            survived = np.sum(arr >= t)
-        S.append(survived / max(N,1))
-    return np.array(S, dtype=float)
+    times = np.array(sorted(step.keys()))
+    S_bins = np.ones(H, float)
+    idx = 0
+    for m in range(1, H+1):
+        while idx < len(times) and times[idx] <= m:
+            S *= step[times[idx]]
+            idx += 1
+        S_bins[m-1] = S
+    return S_bins
 
-def apply_improvement(h: np.ndarray, seg_ranges: List[Tuple[int,int]], seg_improves: List[float]) -> np.ndarray:
-    h2 = h.copy().astype(float)
-    for (a,b), pct in zip(seg_ranges, seg_improves):
-        g = max(0.0, min(1.0, pct/100.0))
-        for t in range(a, b+1):
-            idx = t-1
-            if 0 <= idx < len(h2):
-                h2[idx] *= (1.0 - g)
-    return np.clip(h2, 0.0, 1.0)
+def aurc_sum_left(S, H):
+    """AURC (표준 이산합): sum of S over 0..H-1 with S(0)=1."""
+    H = min(int(H), len(S))
+    auc, prev = 0.0, 1.0
+    for i in range(H):
+        auc += prev
+        prev = S[i]
+    return float(auc)
 
-def median_survival_time(S: np.ndarray) -> Optional[int]:
-    for i, v in enumerate(S, start=1):
-        if v <= 0.5:
-            return i
-    return None
+def aurc_half_trapezoid(S, H):
+    """AURC (호환): 0.5개월 격자 + 사다리꼴 적분.
+    S is post-step monthly values: S[0]=month1 ... S[H-1]=monthH.
+    Build y at 0,0.5,1.0,...,H with step-constant segments.
+    """
+    H = int(H)
+    if H <= 0:
+        return 0.0
+    y = np.empty(2*H + 1, float)
+    y[0] = 1.0
+    y[1] = 1.0
+    for m in range(1, H):
+        y[2*m]   = float(S[m-1])
+        y[2*m+1] = float(S[m-1])
+    y[2*H] = float(S[H-1])
+    return float(np.trapz(y, dx=0.5))
 
-# -------------------- 헤더 --------------------
-st.markdown("<div class='section-title' style='font-size:1.5rem;'>📈 고객 이탈 예측 · AURC 계산기</div>", unsafe_allow_html=True)
-st.markdown("<div class='small-note'>PDF 스타일 · 한 페이지 · 코호트 생존 + 의사결정 카드</div>", unsafe_allow_html=True)
-st.markdown("<hr class='soft'>", unsafe_allow_html=True)
+def hazards_to_survival(h):
+    S=[]; s=1.0
+    for v in h:
+        s *= (1.0 - float(v))
+        S.append(s)
+    return np.array(S, float)
 
-# -------------------- 업로드 Row --------------------
-col_u1, col_u2 = st.columns([1,1])
-with col_u1:
-    st.markdown("<div class='section-card'><div class='section-title'>데이터 업로드</div><div class='section-caption'>CSV를 선택해 주세요.</div>", unsafe_allow_html=True)
-    up = st.file_uploader("CSV 파일", type=["csv"], key="csv_main")
-    st.markdown("</div>", unsafe_allow_html=True)
+def survival_to_hazards(S):
+    h=[]; prev=1.0
+    for cur in S:
+        cur = float(cur)
+        val = 0.0 if prev <= 0 else (1.0 - cur/prev)
+        h.append(max(0.0, min(1.0, val)))
+        prev = cur
+    return np.array(h, float)
 
-with col_u2:
-    st.markdown("<div class='section-card'><div class='section-title'>(선택) 벤치마크 업로드</div><div class='section-caption'>비교용 CSV.</div>", unsafe_allow_html=True)
-    bm = st.file_uploader("벤치마크 CSV", type=["csv"], key="csv_bm")
-    st.markdown("</div>", unsafe_allow_html=True)
+def median_survival_index(S):
+    for i,v in enumerate(S, start=1):
+        if v <= 0.5: return i
+    return float("inf")
 
+def segment_dropout_rate(S, a, b):
+    a = max(1, int(a)); b = max(a, int(b))
+    S_start = 1.0 if a == 1 else float(S[a-2])
+    S_end   = float(S[b-1])
+    return max(0.0, S_start - S_end)
+
+def _find_date_candidates(cols):
+    out = []
+    keys = ["date","datetime","at","time","crda","pay","lst_","reactive"]
+    for c in cols:
+        lc = c.lower()
+        if any(k in lc for k in keys):
+            out.append(c)
+    return out
+
+# ==============================
+# 1) 업로드
+# ==============================
+st.header("1) 데이터 업로드")
+up = st.file_uploader("CSV 업로드 (필수: done_month, tutoring_state; 코호트: fst_months 또는 fst_fst_months)", type=["csv"])
 if up is None:
-    st.info("CSV를 업로드하면 아래 섹션들이 활성화됩니다.")
+    st.info("CSV 업로드 시 아래 단계가 활성화됩니다.")
     st.stop()
 
-# -------------------- 데이터 적재/해석 --------------------
-df = read_csv_kr(up)
-kind, df2 = autodetect_format(df)
+# try encodings
+df = None
+for enc in ["utf-8","cp949","euc-kr"]:
+    try:
+        df = pd.read_csv(up, encoding=enc)
+        break
+    except Exception:
+        pass
+if df is None:
+    st.error("CSV 인코딩을 인식하지 못했습니다. UTF-8로 저장 후 다시 업로드해주세요.")
+    st.stop()
 
-unit_col, horizon_col, opts_col = st.columns([1,1,2])
-with unit_col:
-    st.markdown("<div class='section-card'><div class='section-title'>단위 선택</div>", unsafe_allow_html=True)
-    unit = st.radio("분석 단위", ["월 단위", "주 단위"], index=0, horizontal=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+orig_cols = df.columns.tolist()
+lowmap = {c.lower(): c for c in orig_cols}
+def col(name): return lowmap.get(name.lower())
 
-# S_full, h_full 만들기
-if kind == "agg_survival_month":
-    S_month = df2["survival"].astype(float).to_numpy()
-    if unit == "월 단위":
-        S_full = S_month
-        h_full = survival_to_hazards(S_full)
-    else:
-        h_m = survival_to_hazards(S_month)
-        h_w = 1.0 - (1.0 - h_m)**(1/4)
-        h_w = np.repeat(h_w, 4)
-        h_full = np.clip(h_w, 0, 1)
-        S_full = hazards_to_survival(h_full)
+need = ["done_month","tutoring_state"]
+miss = [n for n in need if col(n) is None]
+if miss:
+    st.error(f"필수 컬럼 누락: {miss}")
+    st.stop()
 
-elif kind == "agg_hazard_month":
-    h_m = np.clip(df2["hazard"].astype(float).to_numpy(), 0, 1)
-    if unit == "월 단위":
-        h_full = h_m
-        S_full = hazards_to_survival(h_full)
-    else:
-        h_w = 1.0 - (1.0 - h_m)**(1/4)
-        h_full = np.repeat(h_w, 4)
-        S_full = hazards_to_survival(h_full)
-
-elif kind == "agg_churn_month":
-    c_m = np.clip(df2["churn"].astype(float).to_numpy(), 0, 1)
-    if unit == "월 단위":
-        h_full = c_m
-        S_full = hazards_to_survival(h_full)
-    else:
-        h_w = 1.0 - (1.0 - c_m)**(1/4)
-        h_full = np.repeat(h_w, 4)
-        S_full = hazards_to_survival(h_full)
-
-elif kind == "raw_done_month":
-    if unit == "월 단위":
-        done = df2["done_month"]
-    else:
-        done = df2["done_month"] * 4.0
-    Tguess = 240 if unit=="월 단위" else 240*4
-    S_full = build_survival_from_done(done, max_time=int(Tguess), treat_nan_as_censored=True)
-    h_full = survival_to_hazards(S_full)
-
-else:  # raw_done_week
-    if unit == "주 단위":
-        done = df2["done_week"]
-    else:
-        done = np.ceil(df2["done_week"] / 4.0)
-    Tguess = 240 if unit=="월 단위" else 240*4
-    S_full = build_survival_from_done(pd.Series(done), max_time=int(Tguess), treat_nan_as_censored=True)
-    h_full = survival_to_hazards(S_full)
-
-T = len(S_full)
-
-with horizon_col:
-    st.markdown("<div class='section-card'><div class='section-title'>분석 기간(Horizon)</div>", unsafe_allow_html=True)
-    default_h = 36 if unit=="월 단위" else 36*4
-    h_default = min(int(default_h), int(T))
-    horizon = st.number_input("AURC 분석 구간(상한)", min_value=6, max_value=int(T), value=int(h_default), step=1)
-    st.markdown("<div class='section-caption small-note'>데이터 길이 T = {}</div>".format(T), unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with opts_col:
-    st.markdown("<div class='section-card'><div class='section-title'>옵션</div>", unsafe_allow_html=True)
-    c1, c2 = st.columns(2)
-    with c1:
-        treat_nan_as_censored = st.checkbox("NaN 검열 처리", value=True)
-    with c2:
-        show_diff = st.checkbox("ΔS(t) 표시", value=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# -------------------- 개선 입력 & KPI --------------------
-S_base = S_full[:int(horizon)]
-h_base = h_full[:int(horizon)]
-
-st.markdown("<div class='section-title' style='margin-top:0.6rem;'>구간 컨벤션(G01~G04) 개선율</div>", unsafe_allow_html=True)
-gcols = st.columns(4)
-base_segments_month = {
-    "G01 결제→매칭": (1, 1),
-    "G02 매칭→첫수업": (2, 2),
-    "G03 첫수업→2회차": (3, 3),
-    "G04 2회차 후 1개월": (4, 5),
-}
-def month_to_unit(rng, unit):
-    if unit == "월 단위": return rng
-    a,b = rng; return ((a-1)*4+1, b*4)
-
-# 기본 개선율(요청 반영)
-default_pct_map = {
-    "G01 결제→매칭": 0.0,
-    "G02 매칭→첫수업": 70.0,
-    "G03 첫수업→2회차": 60.0,
-    "G04 2회차 후 1개월": 50.0,
-}
-
-seg_ranges, seg_improves = {}, {}
-for (name, rng_m), gc in zip(base_segments_month.items(), gcols):
-    a_u, b_u = month_to_unit(rng_m, unit)
-    with gc:
-        st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-        st.markdown(f"<div class='section-title'>{name}</div>", unsafe_allow_html=True)
-        s1, s2 = st.columns(2)
-        with s1:
-            sa = st.number_input("시작", min_value=1, max_value=240, value=int(a_u), step=1, key=f"{name}_s")
-        with s2:
-            sb = st.number_input("종료", min_value=1, max_value=240, value=int(b_u), step=1, key=f"{name}_e")
-        default_pct = float(default_pct_map.get(name, 0.0))
-        pct = st.number_input("개선율(%)", min_value=0.0, max_value=100.0, value=default_pct, step=0.5, key=f"{name}_p")
-        seg_ranges[name] = (int(sa), int(sb))
-        seg_improves[name] = pct
-        st.markdown("</div>", unsafe_allow_html=True)
-
-# 개선 적용
-def apply_improvement(h: np.ndarray, seg_ranges: List[Tuple[int,int]], seg_improves: List[float]) -> np.ndarray:
-    h2 = h.copy().astype(float)
-    for (a,b), pct in zip(seg_ranges, seg_improves):
-        g = max(0.0, min(1.0, pct/100.0))
-        for t in range(a, b+1):
-            idx = t-1
-            if 0 <= idx < len(h2):
-                h2[idx] *= (1.0 - g)
-    return np.clip(h2, 0.0, 1.0)
-
-seg_list = list(seg_ranges.items())
-seg_idx = [v for _, v in seg_list]
-seg_pct = [seg_improves[k] for k, _ in seg_list]
-h_scn = apply_improvement(h_base, seg_idx, seg_pct)
-S_scn = hazards_to_survival(h_scn)
-
-base_aurc = aurc_from_survival(S_base)
-new_aurc  = aurc_from_survival(S_scn)
-delta     = new_aurc - base_aurc
-rel       = (delta/base_aurc*100.0) if base_aurc>0 else np.nan
-
-k1,k2,k3,k4 = st.columns(4)
-with k1:
-    st.markdown("<div class='kpi'><h3>AURC(현재)</h3><div class='val'>{:.2f}</div></div>".format(base_aurc), unsafe_allow_html=True)
-with k2:
-    if unit=="주 단위":
-        st.markdown("<div class='kpi'><h3>AURC(개월 환산)</h3><div class='val'>{:.2f}</div></div>".format(base_aurc/4.0), unsafe_allow_html=True)
-    else:
-        st.markdown("<div class='kpi'><h3>Horizon</h3><div class='val'>{}</div></div>".format(int(horizon)), unsafe_allow_html=True)
-with k3:
-    st.markdown("<div class='kpi'><h3>ΔAURC</h3><div class='val'>{:+.2f}</div></div>".format(delta), unsafe_allow_html=True)
-with k4:
-    st.markdown("<div class='kpi'><h3>단위</h3><div class='val'>{}</div></div>".format("월" if unit=="월 단위" else "주"), unsafe_allow_html=True)
-
-# -------------------- 의사결정 카드 --------------------
-st.markdown("<hr class='soft'>", unsafe_allow_html=True)
-st.markdown("<div class='section-title'>의사결정 카드</div>", unsafe_allow_html=True)
-
-cA, cB, cC, cD = st.columns([1,1,1,1.4])
-with cA:
-    thr_go = st.number_input("Go 임계값 (ΔAURC ≥)", min_value=0.0, max_value=1e6, value=30.0, step=1.0)
-with cB:
-    thr_review = st.number_input("검토 임계값 (ΔAURC ≥)", min_value=0.0, max_value=1e6, value=10.0, step=1.0)
-with cC:
-    min_rel = st.number_input("최소 상대개선(%)", min_value=0.0, max_value=100.0, value=0.0, step=0.5)
-with cD:
-    effort = st.number_input("예상 공수(인일)", min_value=0.0, max_value=1e6, value=5.0, step=0.5)
-
-impact_per_pd = (delta / effort) if effort>0 else np.nan
-meets_rel = (rel >= min_rel) if not np.isnan(rel) else False
-
-def decide(delta, rel, thr_go, thr_review, min_rel):
-    if np.isnan(rel):  # base_aurc=0 등
-        rel_ok = True  # 상대조건 무시
-    else:
-        rel_ok = rel >= min_rel
-    if (delta >= thr_go) and rel_ok:
-        return "Go", "badge-go", "go"
-    if (delta >= thr_review) and rel_ok:
-        return "검토", "badge-review", "review"
-    return "보류", "badge-hold", "hold"
-
-label, badge, cls = decide(delta, rel, thr_go, thr_review, min_rel)
-
-card_html = f"""
-<div class="decision {cls}">
-  <h3>권고안: <span class="badge {badge}">{label}</span></h3>
-  <ul class="tight">
-    <li>실측 ΔAURC: <b>{delta:+.2f}</b> (기준: Go ≥ {thr_go:.2f}, 검토 ≥ {thr_review:.2f})</li>
-    <li>상대 개선율: <b>{(0 if np.isnan(rel) else rel):.2f}%</b> (최소 요구치 ≥ {min_rel:.2f}%)</li>
-    <li>예상 공수: <b>{effort:.1f} 인일</b> → Impact/인일: <b>{(0 if np.isnan(impact_per_pd) else impact_per_pd):.2f}</b></li>
-  </ul>
-  <div class="small-note">※ 임계값은 조직 컨벤션에 맞게 조정하세요. (예: ΔAURC 30=Go, 10~30=검토, &lt;10=보류)</div>
-</div>
-"""
-st.markdown(card_html, unsafe_allow_html=True)
-
-st.markdown("<hr class='soft'>", unsafe_allow_html=True)
-
-# -------------------- 그래프 Row --------------------
-t_axis = np.arange(1, len(S_base)+1)
-gc1, gc2 = st.columns([2,1])
-with gc1:
-    st.markdown("<div class='section-card'><div class='section-title'>생존곡선 S(t)</div>", unsafe_allow_html=True)
-    fig1, ax1 = plt.subplots(figsize=(9,4))
-    sns.lineplot(x=t_axis, y=S_base, marker="o", ax=ax1, label="현재", color="#111827")
-    sns.lineplot(x=t_axis, y=S_scn[:len(S_base)], marker="x", ax=ax1, label="개선 후", color="#2563eb")
-    ax1.set_xlabel("월" if unit=="월 단위" else "주")
-    ax1.set_ylabel("생존확률 S(t)")
-    for name, (a,b) in seg_ranges.items():
-        ax1.axvspan(a-0.5, b+0.5, alpha=0.08)
-    st.pyplot(fig1)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with gc2:
-    if len(S_base)>0 and show_diff:
-        st.markdown("<div class='section-card'><div class='section-title'>차이 곡선 ΔS(t)</div>", unsafe_allow_html=True)
-        diff = (S_scn[:len(S_base)] - S_base)
-        figd, axd = plt.subplots(figsize=(6,4))
-        axd.plot(np.arange(1, len(diff)+1), diff, linewidth=1.8, color="#ef4444")
-        axd.axhline(0, linestyle="--", linewidth=1, color="#9ca3af")
-        axd.set_xlabel("월" if unit=="월 단위" else "주")
-        axd.set_ylabel("차이 ΔS(t)")
-        st.pyplot(figd)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-# -------------------- Hazard (막대 전용) --------------------
-st.markdown("<div class='section-card'><div class='section-title'>이탈위험 Hazard(t)</div>", unsafe_allow_html=True)
-if len(S_base) > 0:
-    tmp = pd.DataFrame({"t": t_axis, "현재": h_base[:len(t_axis)], "개선 후": h_scn[:len(t_axis)]})
-    tmpm = tmp.melt(id_vars="t", value_vars=["현재","개선 후"], var_name="series", value_name="hazard")
-    fig2, ax2 = plt.subplots(figsize=(9,4))
-    sns.barplot(data=tmpm, x="t", y="hazard", hue="series", ax=ax2, palette=["#94a3b8","#3b82f6"])
-    ax2.set_xlabel("월" if unit=="월 단위" else "주")
-    ax2.set_ylabel("이탈위험 Hazard(t)")
-    st.pyplot(fig2)
-st.markdown("</div>", unsafe_allow_html=True)
-
-# -------------------- 구매 개월수별 생존 (fst_months 전용) --------------------
-st.markdown("<div class='section-card'><div class='section-title'>구매 개월수별 생존 (fst_months)</div><div class='section-caption'>1/3/6/12개월 코호트를 fst_months로 구분, 개별 ON/OFF.</div>", unsafe_allow_html=True)
-
-if "fst_months" not in df2.columns:
-    st.warning("'fst_months' 컬럼을 찾지 못했습니다. CSV에 'fst_months'를 포함해 주세요.")
+# ==============================
+# 2) 날짜 필터
+# ==============================
+st.header("2) 날짜 필터 (선택/직접 입력)")
+date_candidates = _find_date_candidates(orig_cols)
+if len(date_candidates) == 0:
+    st.caption("날짜 후보 컬럼을 찾지 못했습니다. 이 섹션을 건너뜁니다.")
 else:
-    COHORT_LEVELS = [1,3,6,12]
-    cbox_cols = st.columns(4)
-    chosen = []
-    for m, cbc in zip(COHORT_LEVELS, cbox_cols):
-        with cbc:
-            if st.checkbox(f"{m}개월 표시", value=True, key=f"cohort_{m}"):
-                chosen.append(m)
+    date_col = st.selectbox("필터할 날짜 컬럼", date_candidates, index=0)
+    dt = pd.to_datetime(df[date_col], errors="coerce")
+    df["_filter_dt"] = dt
+    if df["_filter_dt"].notna().any():
+        min_dt = pd.to_datetime(df["_filter_dt"].min()).date()
+        max_dt = pd.to_datetime(df["_filter_dt"].max()).date()
 
-    if len(chosen) == 0:
-        st.info("표시할 코호트를 하나 이상 선택해 주세요.")
-    else:
-        palette = {1:"#22c55e", 3:"#14b8a6", 6:"#a855f7", 12:"#ef4444", "전체":"#111827"}
-        figc, axc = plt.subplots(figsize=(9,4))
-        axc.plot(t_axis, S_base, label="전체", linewidth=2.0, color=palette["전체"])
+        mode = st.radio("입력 방식", ["선택박스", "직접 입력(YYYY-MM-DD)"], horizontal=True, index=0)
 
-        cohort_rows = []
-        for m in chosen:
-            sub = df2[df2["fst_months"]==m]
-            if sub.empty:
-                continue
-            if kind == "raw_done_week":
-                done_vec = sub["done_week"] if unit=="주 단위" else np.ceil(sub["done_week"]/4.0)
-            elif kind == "raw_done_month":
-                done_vec = sub["done_month"] if unit=="월 단위" else sub["done_month"]*4.0
+        def _parse_date_str(s: str):
+            s = (s or "").strip()
+            if not s: return None
+            s = re.sub(r"[./]", "-", s)
+            s = re.sub(r"\s+", "", s)
+            ts = pd.to_datetime(s, errors="coerce")
+            return None if pd.isna(ts) else pd.Timestamp(ts)
+
+        if mode == "선택박스":
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**시작일**")
+                years = list(range(min_dt.year, max_dt.year+1))
+                y_start = st.selectbox("년", years, index=0, key="y_start")
+                m_start = st.selectbox("월", list(range(1,13)), index=max(0, min_dt.month-1), key="m_start")
+                max_day_s = _cal.monthrange(y_start, m_start)[1]
+                d_start = st.selectbox("일", list(range(1, max_day_s+1)),
+                                       index=max(0, min(min_dt.day, max_day_s)-1), key="d_start")
+                start = pd.Timestamp(year=y_start, month=m_start, day=d_start)
+            with c2:
+                st.markdown("**종료일**")
+                y_end = st.selectbox("년 ", years, index=len(years)-1, key="y_end")
+                m_end = st.selectbox("월 ", list(range(1,13)), index=max(0, max_dt.month-1), key="m_end")
+                max_day_e = _cal.monthrange(y_end, m_end)[1]
+                d_end = st.selectbox("일 ", list(range(1, max_day_e+1)),
+                                     index=max(0, min(max_dt.day, max_day_e)-1), key="d_end")
+                end = pd.Timestamp(year=y_end, month=m_end, day=d_end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                start_txt = st.text_input("시작일 (YYYY-MM-DD)", value=min_dt.strftime("%Y-%m-%d"))
+            with c2:
+                end_txt = st.text_input("종료일 (YYYY-MM-DD)", value=max_dt.strftime("%Y-%m-%d"))
+            range_txt = st.text_input("또는 한 줄로 (예: 2023-05-01 ~ 2024-04-30)", value="")
+            if range_txt.strip():
+                parts = re.split(r"\s*[~〜–—]\s*", range_txt.strip())
+                if len(parts) == 2:
+                    start_txt, end_txt = parts[0].strip(), parts[1].strip()
+            start = _parse_date_str(start_txt)
+            end_raw = _parse_date_str(end_txt)
+            end = None if end_raw is None else (end_raw + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))
+
+        if (start is not None) and (end is not None):
+            if start > end:
+                st.error("시작일이 종료일보다 클 수 없습니다.")
             else:
-                continue
-            S_c = build_survival_from_done(done_vec, max_time=int(horizon), treat_nan_as_censored=True)
-            axc.plot(np.arange(1, len(S_c)+1), S_c, label=f"{m}개월", linewidth=1.8, color=palette.get(m, None))
-            n_total = len(done_vec)
-            n_end = int(np.sum(~pd.isna(done_vec)))
-            churn_rate = n_end / n_total if n_total>0 else np.nan
-            A = aurc_from_survival(S_c, horizon=int(horizon))
-            med = median_survival_time(S_c)
-            cohort_rows.append([f"{m}개월", n_total, churn_rate*100 if pd.notna(churn_rate) else np.nan, A, med])
-
-        axc.set_xlabel("월" if unit=="월 단위" else "주")
-        axc.set_ylabel("생존확률 S(t)")
-        axc.legend()
-        st.pyplot(figc)
-
-        if cohort_rows:
-            dfco = pd.DataFrame(cohort_rows, columns=["코호트","샘플 수","중단율(%)","AURC","중위 생존(단위)"])
-            st.dataframe(dfco, use_container_width=True)
+                mask = (df["_filter_dt"] >= start) & (df["_filter_dt"] <= end)
+                before = len(df)
+                df = df.loc[mask].drop(columns=["_filter_dt"]).copy()
+                st.caption(f"필터 적용: {date_col} ∈ [{start.date()} ~ {end.normalize().date()}], 행수 {before} → {len(df)}")
         else:
-            st.info("선택한 코호트를 찾지 못했습니다.")
-
-st.markdown("</div>", unsafe_allow_html=True)
-
-# -------------------- 결과 표(전체) --------------------
-def results_df(unit: str, base_aurc: float, new_aurc: float, horizon: int):
-    rows = []
-    if unit == "주 단위":
-        rows.append(["현재", base_aurc, base_aurc/4.0, horizon, "주"])
-        rows.append(["개선 후", new_aurc, new_aurc/4.0, horizon, "주"])
+            df = df.drop(columns=["_filter_dt"], errors="ignore")
     else:
-        rows.append(["현재", base_aurc, base_aurc, horizon, "개월"])
-        rows.append(["개선 후", new_aurc, new_aurc, horizon, "개월"])
-    dfres = pd.DataFrame(rows, columns=["구분", "AURC(원단위)", "AURC(개월 환산)", "Horizon", "단위"])
-    dfres["ΔAURC"] = [np.nan, new_aurc - base_aurc]
-    dfres["개선율(%)"] = [np.nan, (new_aurc-base_aurc)/base_aurc*100.0 if base_aurc>0 else np.nan]
-    return dfres
+        st.warning("선택한 컬럼에서 유효한 날짜를 찾지 못해 날짜 필터를 건너뜁니다.")
 
-st.markdown("<div class='section-card'><div class='section-title'>AURC 분석 결과 (표)</div>", unsafe_allow_html=True)
-st.dataframe(results_df(unit, base_aurc, new_aurc, int(horizon)), use_container_width=True)
-st.markdown("</div>", unsafe_allow_html=True)
+st.markdown("<hr/>", unsafe_allow_html=True)
 
-# -------------------- QA --------------------
-st.markdown("<div class='section-card'><div class='section-title'>Data QA</div>", unsafe_allow_html=True)
-if kind.startswith("raw_done"):
-    x = df2["done_week"] if kind=="raw_done_week" else df2["done_month"]
-    if unit == "주 단위" and kind=="raw_done_month":
-        x = x * 4.0
-    if unit == "월 단위" and kind=="raw_done_week":
-        x = np.ceil(x / 4.0)
-    total_n = len(x)
-    ended = int(np.sum(~pd.isna(x)))
-    active = int(total_n - ended)
-    qc1,qc2,qc3 = st.columns(3)
-    qc1.metric("총 샘플 수", total_n)
-    qc2.metric("종료 수", ended)
-    qc3.metric("검열 수", active)
+# ==============================
+# 3) 생존분석(KM) — 시간 단위/격자 + 호환 모드
+# ==============================
+st.header("3) 현재 생존분석 (KM)")
 
-    figd2, axd2 = plt.subplots(figsize=(9,3))
-    bins = int(max(10, min(60, len(S_full))))
-    sns.histplot(x, bins=bins, ax=axd2, color="#64748b")
-    axd2.set_xlabel("월" if unit=="월 단위" else "주")
-    st.pyplot(figd2)
+unit = st.radio("시간 격자(단위)", ["월(표준)", "주(표준)", "0.5개월+사다리꼴(호환)"], horizontal=True, index=0)
+is_week = unit.startswith("주")
+is_half = unit.startswith("0.5")
 
-    st.caption("※ G02 이탈률은 done_* 기반 근사치이며, 검열 보정이 완전하지 않을 수 있습니다.")
+with st.expander("🧩 레거시 호환 모드 (옵션)", expanded=False):
+    use_active_correction = st.checkbox("진행중 보정 적용 (0.8×, 28일=1개월)", value=False)
+    cutoff_date = st.date_input("컷오프 날짜", value=pd.to_datetime("2025-07-13").date())
+    st.caption("설명: 활성인데 마지막 수업일이 컷오프 이전이면 중단으로 간주하고 done_month를 실개월×0.8로 보정합니다.")
+
+# Horizon 입력 (단위에 맞춰)
+if is_week:
+    H = st.number_input("Horizon (주)", min_value=8, max_value=240, value=52, step=1)
+elif is_half:
+    H = st.number_input("Horizon (개월, 호환)", min_value=6, max_value=60, value=36, step=1)
 else:
-    st.caption("집계형 데이터이므로 QA 상세(분모/분자)는 제한됩니다.")
-st.markdown("</div>", unsafe_allow_html=True)
+    H = st.number_input("Horizon (개월)", min_value=6, max_value=60, value=36, step=1)
 
-# -------------------- 벤치마크 비교 --------------------
-if bm is not None:
-    st.markdown("<div class='section-card'><div class='section-title'>벤치마크 비교</div>", unsafe_allow_html=True)
-    dfb = read_csv_kr(bm)
-    kind_b, dfb2 = autodetect_format(dfb)
+# 이벤트/기간 원본
+state = df[col("tutoring_state")].astype(str).str.lower()
+events = state.isin(STOP).values
+dur_m = to_num(df[col("done_month")]).fillna(0.0).values  # months(4wk)
 
-    def hazards_to_survival(h: np.ndarray) -> np.ndarray:
-        S, surv = [], 1.0
-        for hm in h:
-            surv *= max(0.0, 1.0 - float(hm))
-            S.append(surv)
-        return np.array(S, dtype=float)
-    def survival_to_hazards(S: np.ndarray) -> np.ndarray:
-        h, prev = [], 1.0
-        for s in S:
-            s = float(s)
-            h.append(0.0 if prev <= 0 else max(0.0, 1.0 - s/prev))
-            prev = s
-        return np.array(h, dtype=float)
+# 진행중 보정
+if use_active_correction:
+    crda_col = col("crda") or col("fst_pay_date")
+    lst_col  = col("lst_tutoring_datetime")
+    if crda_col is not None and lst_col is not None:
+        crda = pd.to_datetime(df[crda_col], errors="coerce")
+        lst  = pd.to_datetime(df[lst_col], errors="coerce")
+        cutoff_ts = pd.to_datetime(cutoff_date)
 
-    if kind_b == "agg_survival_month":
-        Sb_m = dfb2["survival"].astype(float).to_numpy()
-        if unit == "월 단위":
-            Sb = Sb_m
-        else:
-            hb_m = survival_to_hazards(Sb_m)
-            hb_w = 1.0 - (1.0 - hb_m)**(1/4)
-            hb_w = np.repeat(hb_w, 4)
-            Sb = hazards_to_survival(hb_w)
-    elif kind_b == "agg_hazard_month":
-        Hb_m = np.clip(dfb2["hazard"].astype(float).to_numpy(), 0, 1)
-        if unit == "월 단위":
-            Sb = hazards_to_survival(Hb_m)
-        else:
-            Hb_w = 1.0 - (1.0 - Hb_m)**(1/4)
-            Hb_w = np.repeat(Hb_w, 4)
-            Sb = hazards_to_survival(Hb_w)
-    elif kind_b == "agg_churn_month":
-        Cb_m = np.clip(dfb2["churn"].astype(float).to_numpy(), 0, 1)
-        if unit == "월 단위":
-            Sb = hazards_to_survival(Cb_m)
-        else:
-            Hb_w = 1.0 - (1.0 - Cb_m)**(1/4)
-            Hb_w = np.repeat(Hb_w, 4)
-            Sb = hazards_to_survival(Hb_w)
-    elif kind_b == "raw_done_month":
-        Db = dfb2["done_month"] if unit=="월 단위" else dfb2["done_month"]*4.0
-        Sb = build_survival_from_done(Db, max_time=int(len(S_full)), treat_nan_as_censored=True)
-    else:  # raw_done_week
-        Db = dfb2["done_week"] if unit=="주 단위" else np.ceil(dfb2["done_week"]/4.0)
-        Sb = build_survival_from_done(pd.Series(Db), max_time=int(len(S_full)), treat_nan_as_censored=True)
+        active_mask = ~state.isin(STOP)
+        to_finish = active_mask & lst.notna() & (lst < cutoff_ts)
 
-    Sb = Sb[:len(S_base)]
-    auc_b = aurc_from_survival(Sb)
-    cc1,cc2 = st.columns(2)
-    if unit == "주 단위":
-        cc1.metric("AURC(현재, 주)", f"{aurc_from_survival(S_base):.2f}")
-        cc2.metric("AURC(벤치마크, 주)", f"{auc_b:.2f}")
-        st.caption(f"개월 환산: 현재 {aurc_from_survival(S_base)/4:.2f} vs 벤치마크 {auc_b/4:.2f}")
+        # 28일=1개월 환산
+        actual_m = (lst - crda).dt.total_seconds()/(60*60*24*28.0)
+        dm = to_num(df[col("done_month")])
+        need_corr = to_finish & dm.notna() & actual_m.notna() & (dm > actual_m)
+        dm_corr = dm.copy()
+        dm_corr.loc[need_corr] = actual_m[need_corr] * 0.8
+
+        events = (state.isin(STOP) | to_finish).values
+        dur_m  = dm_corr.fillna(0.0).values
     else:
-        cc1.metric("AURC(현재, 개월)", f"{aurc_from_survival(S_base):.2f}")
-        cc2.metric("AURC(벤치마크, 개월)", f"{auc_b:.2f}")
+        st.warning("진행중 보정을 위해 crda/fst_pay_date & lst_tutoring_datetime 컬럼이 필요합니다.")
 
-    figb, axb = plt.subplots(figsize=(9,4))
-    sns.lineplot(x=np.arange(1, len(S_base)+1), y=S_base, ax=axb, label="현재", color="#111827")
-    sns.lineplot(x=np.arange(1, len(Sb)+1), y=Sb, ax=axb, label="벤치마크", color="#0ea5e9")
-    axb.set_xlabel("월" if unit=="월 단위" else "주")
-    axb.set_ylabel("생존확률 S(t)")
-    st.pyplot(figb)
-    st.markdown("</div>", unsafe_allow_html=True)
+# KM 계산
+if is_half:
+    # half-month grid uses monthly S, then special trapezoid AURC
+    S_all = km_bins_timegrid(dur_m, events, int(H), unit="month")
+else:
+    grid_unit = "week" if is_week else "month"
+    S_all = km_bins_timegrid(dur_m, events, int(H), unit=grid_unit)
+
+# AURC 계산
+def calc_aurc(S, H):
+    if is_half:
+        return aurc_half_trapezoid(S, H)
+    else:
+        return aurc_sum_left(S, H)
+
+A_all = calc_aurc(S_all, H)
+med_idx = median_survival_index(S_all)
+
+n_total = len(df)
+n_stop = int(events.sum())
+n_active = n_total - n_stop
+
+label_unit = "주" if is_week else "개월"
+aurc_label = "0.5개월 사다리꼴" if is_half else f"{label_unit} 합"
+
+c1,c2,c3,c4 = st.columns(4)
+with c1: st.markdown(f"<div class='card'><div class='label'>분석 대상</div><div class='value'>{n_total:,}</div></div>", unsafe_allow_html=True)
+with c2: st.markdown(f"<div class='card'><div class='label'>중단 수업</div><div class='value'>{n_stop:,}</div></div>", unsafe_allow_html=True)
+with c3: st.markdown(f"<div class='card'><div class='label'>활성 수업</div><div class='value'>{n_active:,}</div></div>", unsafe_allow_html=True)
+with c4: st.markdown(f"<div class='card'><div class='label'>AURC ({aurc_label}; 0~{int(H)})</div><div class='value'>{A_all:.2f}</div></div>", unsafe_allow_html=True)
+
+# 곡선
+x = np.arange(0, int(H)+1)
+fig, ax = plt.subplots(figsize=(8,4))
+ax.step(x, np.concatenate([[1.0], S_all]), where="post", label="전체(KM)")
+ax.set_ylim(0,1.02); ax.set_xlabel(label_unit); ax.set_ylabel("생존확률 S(t)"); ax.grid(alpha=.3); ax.legend()
+st.pyplot(fig)
+
+# ---- 구매 개월수별 생존 곡선 (KM) ----
+st.subheader("구매 개월수별 생존 곡선 (KM)")
+cohort_col_plot = col("fst_months") or col("fst_fst_months")
+if cohort_col_plot is None:
+    st.caption("코호트 컬럼(fst_months / fst_fst_months)을 찾지 못해 곡선을 그릴 수 없습니다.")
+else:
+    cm = pd.to_numeric(df[cohort_col_plot], errors="coerce")
+    cohorts = [("전체", None)]
+    for m in [1,3,6,12]:
+        if (cm == m).any():
+            cohorts.append((f"{m}개월 구매", m))
+    figc, axc = plt.subplots(figsize=(8,4))
+    axc.step(x, np.concatenate([[1.0], S_all]), where="post", label="전체")
+    for label, m in cohorts[1:]:
+        g = df.loc[cm == m]
+        if len(g) == 0: continue
+        e = g[col("tutoring_state")].astype(str).str.lower().isin(STOP).values
+        d = to_num(g[col("done_month")]).fillna(0.0).values
+        if is_half:
+            Sg = km_bins_timegrid(d, e, int(H), unit="month")
+        else:
+            Sg = km_bins_timegrid(d, e, int(H), unit=("week" if is_week else "month"))
+        axc.step(x, np.concatenate([[1.0], Sg]), where="post", label=label)
+    axc.set_ylim(0,1.02); axc.set_xlabel(label_unit); axc.set_ylabel("생존확률 S(t)"); axc.grid(alpha=.3); axc.legend()
+    st.pyplot(figc)
+
+# ---- 이탈률 표(KM) ----
+st.subheader("월별/주별 이탈률 (KM 정의)")
+S_post = np.concatenate([[1.0], S_all])
+haz_km = 1.0 - (S_post[1:] / np.clip(S_post[:-1], 1e-12, None))
+churn_cum = 1.0 - S_all
+churn_df = pd.DataFrame({
+    label_unit: np.arange(1, int(H)+1),
+    "이탈률(KM, %)": (haz_km*100).round(2),
+    "누적 이탈률(%, 1-S(t))": (churn_cum*100).round(2)
+})
+st.dataframe(churn_df, use_container_width=True)
+
+st.markdown("<hr/>", unsafe_allow_html=True)
+
+# ==============================
+# 4) 구간 개선 목표 설정 (단위 인지)
+# ==============================
+st.header("4) 구간 개선 목표 설정")
+
+mode = st.radio("세그먼트 정의 방식", ["간단 근사(격자 단위)", "이벤트-앵커 근사(회차 스케줄 유도)(비활성화 상태)"], index=0, horizontal=True)
+
+h_base = survival_to_hazards(S_all).copy()
+
+def render_cards(cards, unit_name):
+    for name, cur, new, pct in cards:
+        st.write(f"**{name}** — 현재 이탈률: {cur:.2f}% → 개선율 {pct}% → 개선 후 {new:.2f}% ({unit_name} 기준)")
+
+if mode.startswith("간단"):
+    st.caption(f"선택한 격자({label_unit}) 기준으로 초기 {label_unit}별 세그먼트 3개를 제공합니다.")
+    cols = st.columns(3)
+    defaults = [70, 60, 50]
+    if is_week:
+        segments = [("첫 주 (W1)",1,1), ("둘째 주 (W2)",2,2), ("셋째 주 (W3)",3,3)]
+    elif is_half:
+        # half-month grid still applies improvements on monthly hazards
+        segments = [("첫 달 (M1)",1,1), ("둘째 달 (M2)",2,2), ("셋째 달 (M3)",3,3)]
+    else:
+        segments = [("첫 달 (M1)",1,1), ("둘째 달 (M2)",2,2), ("셋째 달 (M3)",3,3)]
+    user_pcts = []
+    for i,(nm,a,b) in enumerate(segments):
+        with cols[i]:
+            user_pcts.append(st.number_input(f"{nm} 개선율(%)", min_value=0, max_value=100, value=defaults[i], step=1))
+    cards=[]; h_tmp = h_base.copy()
+    for (nm,a,b), pct in zip(segments, user_pcts):
+        cur = segment_dropout_rate(S_all, a, b) * 100.0
+        h_tmp[a-1:b] = h_tmp[a-1:b] * (1.0 - pct/100.0)
+        S_tmp = hazards_to_survival(h_tmp)
+        new = segment_dropout_rate(S_tmp, a, b) * 100.0
+        cards.append((nm, cur, new, pct))
+    render_cards(cards, label_unit)
+    S_scn = hazards_to_survival(h_tmp)
+
+else:
+    st.caption("앵커=결제일(crda/fst_pay_date). 주당 회차/예정일을 활용한 커버리지 가중은 다음 릴리스에서 활성화됩니다.")
+    S_scn = S_all
+
+st.markdown("<hr/>", unsafe_allow_html=True)
+
+# ==============================
+# 5) 개선 효과 결과 (단위 인지)
+# ==============================
+st.header("5) 개선 효과 결과")
+def calc_A(S,H):
+    return aurc_half_trapezoid(S,H) if is_half else aurc_sum_left(S,H)
+
+A0 = calc_A(S_all, H)
+A1 = calc_A(S_scn, H) if 'S_scn' in locals() else A0
+dA = A1 - A0
+ratio = (A1/A0 - 1.0)*100.0 if A0>0 else np.nan
+
+k1,k2,k3 = st.columns(3)
+with k1: st.markdown(f"<div class='card'><div class='label'>Baseline AURC ({aurc_label})</div><div class='value'>{A0:.2f}</div></div>", unsafe_allow_html=True)
+with k2: st.markdown(f"<div class='card'><div class='label'>Scenario AURC ({aurc_label})</div><div class='value'>{A1:.2f}</div></div>", unsafe_allow_html=True)
+with k3: st.markdown(f"<div class='card'><div class='label'>ΔAURC / 개선율</div><div class='value'>{dA:+.2f} / {ratio:+.1f}%</div></div>", unsafe_allow_html=True)
+
+fig2, ax2 = plt.subplots(figsize=(8,4))
+ax2.step(np.arange(0,int(H)+1), np.concatenate([[1.0], S_all]), where="post", label="현재")
+ax2.step(np.arange(0,int(H)+1), np.concatenate([[1.0], S_scn if 'S_scn' in locals() else S_all]), where="post", label="개선 후")
+ax2.set_ylim(0,1.02); ax2.set_xlabel(label_unit); ax2.set_ylabel("생존확률 S(t)"); ax2.grid(alpha=.3); ax2.legend()
+st.pyplot(fig2)
+
+st.markdown("<hr/>", unsafe_allow_html=True)
+
+# ==============================
+# 6) 코호트별 개선 효과 요약
+# ==============================
+st.header("6) 코호트별 개선 효과 요약")
+
+def apply_simple_segments_to_df(df_sub, H, segments_with_pct, is_half, is_week):
+    e = df_sub[col("tutoring_state")].astype(str).str.lower().isin(STOP).values
+    d_m = to_num(df_sub[col("done_month")]).fillna(0.0).values
+    if is_half:
+        S = km_bins_timegrid(d_m, e, int(H), unit="month")
+    else:
+        S = km_bins_timegrid(d_m, e, int(H), unit=("week" if is_week else "month"))
+    A0 = calc_A(S, H)
+    h = survival_to_hazards(S).copy()
+    for (a,b,pct) in segments_with_pct:
+        h[a-1:b] = h[a-1:b] * (1.0 - pct/100.0)
+    S2 = hazards_to_survival(h); A1 = calc_A(S2, H)
+    return A0, A1
+
+if 'user_pcts' in locals():
+    if is_week:
+        segs = [(1,1,user_pcts[0]), (2,2,user_pcts[1]), (3,3,user_pcts[2])]
+    else:
+        segs = [(1,1,user_pcts[0]), (2,2,user_pcts[1]), (3,3,user_pcts[2])]
+else:
+    segs = [(1,1,70), (2,2,60), (3,3,50)]
+
+A0_all, A1_all = apply_simple_segments_to_df(df, H, segs, is_half, is_week)
+cohort_rows = [["전체", len(df), round(A0_all,2), round(A1_all,2), round(A1_all-A0_all,2), round((A1_all/A0_all-1.0)*100.0,1) if A0_all>0 else np.nan]]
+
+cohort_col2 = col("fst_months") or col("fst_fst_months")
+if cohort_col2 is not None:
+    cm2 = pd.to_numeric(df[cohort_col2], errors="coerce")
+    for m in [1,3,6,12]:
+        g = df.loc[cm2==m]
+        if len(g)==0: continue
+        A0_g, A1_g = apply_simple_segments_to_df(g, H, segs, is_half, is_week)
+        cohort_rows.append([f"{m}개월 구매", len(g), round(A0_g,2), round(A1_g,2), round(A1_g-A0_g,2), round((A1_g/A0_g-1.0)*100.0,1) if A0_g>0 else np.nan])
+
+out = pd.DataFrame(cohort_rows, columns=["구분","N","현재 AUC","개선 후 AUC","증가량","개선율(%)"])
+order = ["전체","1개월 구매","3개월 구매","6개월 구매","12개월 구매"]
+out["__ord"] = pd.Categorical(out["구분"], categories=order, ordered=True)
+st.dataframe(out.sort_values("__ord").drop(columns="__ord").reset_index(drop=True), use_container_width=True)
+
+st.caption("설명: 격자를 월/주로 바꿔 AURC와 이탈률을 확인할 수 있습니다. 호환 모드는 레거시 재현용입니다.")
