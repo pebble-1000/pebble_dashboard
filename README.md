@@ -1,4 +1,4 @@
-# 🧭 AURC & 이탈률 계산기 (ver.3 · Spillover 반영)
+# 🧭 AURC & 이탈률 계산기 (ver.3 · Spillover 반영) _ aurc_calc_v4.py
 
 ## 🎯 목적
 고객(학생)의 **이탈 시점과 잔존 유지력**을 분석하고,  
